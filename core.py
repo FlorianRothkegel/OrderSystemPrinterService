@@ -1,0 +1,886 @@
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import tempfile
+import textwrap
+import threading
+import time
+from dataclasses import asdict, dataclass, fields as dataclass_fields
+from pathlib import Path
+from typing import Callable
+from urllib import error, parse, request
+
+
+DEFAULT_CONFIG_PATH = Path.home() / ".ordersystem_printer_service.json"
+TRANSIENT_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+MAX_RETRY_DELAY_SECONDS = 30
+RECEIPT_LINE_WIDTH = 42
+
+
+@dataclass
+class AppConfig:
+    backend_url: str = "http://127.0.0.1"
+    event_id: str = ""
+    station_code: str = ""
+    oidc_token_url: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    agent_name: str = platform.node() or "printer-agent"
+    poll_interval_seconds: int = 2
+    printer_mode: str = "preview"
+    printer_command: str = "lp {file}"
+    output_path: str = str(Path.home() / "ordersystem_tickets.txt")
+    escpos_host: str = ""
+    escpos_port: int = 9100
+    escpos_order_text_size: int = 2
+    escpos_table_text_size: int = 3
+    escpos_cut_paper: bool = True
+
+
+class BackendRequestError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class HealthStatus:
+    ok: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class _CachedBearerToken:
+    token: str
+    refresh_at_monotonic: float
+
+
+def _http_request(
+    req: request.Request,
+    *,
+    timeout: float,
+) -> tuple[int, str, str]:
+    try:
+        with request.urlopen(req, timeout=timeout) as response:
+            status_code = response.getcode()
+            body = response.read().decode("utf-8", errors="replace")
+            content_type = response.headers.get("Content-Type", "")
+            return status_code, body, content_type
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return exc.code, body, exc.headers.get("Content-Type", "")
+
+
+def _normalize_instance_name(instance_name: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", instance_name.strip()).strip("-._")
+    return normalized or "default"
+
+
+def _normalize_backend_base_url(raw_backend_url: str) -> str:
+    backend_url = raw_backend_url.strip().rstrip("/")
+    if backend_url.lower().endswith("/api"):
+        return backend_url[:-4]
+    return backend_url
+
+
+def resolve_config_path(*, instance_name: str | None = None, config_path: str | Path | None = None) -> Path:
+    if config_path is not None:
+        return Path(config_path).expanduser()
+    if instance_name:
+        return Path.home() / f".ordersystem_printer_service_{_normalize_instance_name(instance_name)}.json"
+    return DEFAULT_CONFIG_PATH
+
+
+def load_config(config_path: str | Path | None = None) -> AppConfig:
+    resolved_path = resolve_config_path(config_path=config_path)
+    if not resolved_path.exists():
+        return AppConfig()
+    try:
+        raw = json.loads(resolved_path.read_text(encoding="utf-8"))
+        allowed_keys = {field.name for field in dataclass_fields(AppConfig)}
+        normalized = {key: value for key, value in raw.items() if key in allowed_keys} if isinstance(raw, dict) else {}
+        return AppConfig(**normalized)
+    except Exception:
+        return AppConfig()
+
+
+def save_config(config: AppConfig, config_path: str | Path | None = None) -> None:
+    resolved_path = resolve_config_path(config_path=config_path)
+    resolved_path.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+
+
+class KeycloakTokenProvider:
+    def __init__(self, token_url: str, client_id: str, client_secret: str) -> None:
+        self.token_url = token_url.strip()
+        self.client_id = client_id.strip()
+        self.client_secret = client_secret.strip()
+        self._lock = threading.Lock()
+        self._cached: _CachedBearerToken | None = None
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._cached = None
+
+    def get_access_token(self, timeout: float = 10.0, *, force_refresh: bool = False) -> str:
+        with self._lock:
+            now_monotonic = time.monotonic()
+            if not force_refresh and self._cached is not None and now_monotonic < self._cached.refresh_at_monotonic:
+                return self._cached.token
+
+            token, refresh_at = self._fetch_access_token(timeout)
+            self._cached = _CachedBearerToken(token=token, refresh_at_monotonic=refresh_at)
+            return token
+
+    def get_authorization_header(self, timeout: float = 10.0, *, force_refresh: bool = False) -> str:
+        return f"Bearer {self.get_access_token(timeout, force_refresh=force_refresh)}"
+
+    def _fetch_access_token(self, timeout: float) -> tuple[str, float]:
+        payload = parse.urlencode(
+            {
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            }
+        ).encode("utf-8")
+        req = request.Request(
+            self.token_url,
+            data=payload,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "OrderSystemPrinterService/1.0",
+            },
+            method="POST",
+        )
+        try:
+            status_code, body, content_type = _http_request(req, timeout=timeout)
+        except error.URLError as exc:
+            raise BackendRequestError(f"Keycloak token request failed: {exc.reason}", retryable=True) from exc
+        except TimeoutError as exc:
+            raise BackendRequestError("Keycloak token request timed out", retryable=True) from exc
+
+        if not 200 <= status_code < 300:
+            raise BackendRequestError(
+                _summarize_http_error(status_code, body, content_type),
+                retryable=status_code in TRANSIENT_HTTP_STATUS_CODES,
+                status_code=status_code,
+            )
+
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise BackendRequestError("Keycloak token response was not valid JSON", retryable=False) from exc
+
+        access_token = str(parsed.get("access_token") or "").strip()
+        if not access_token:
+            raise BackendRequestError("Keycloak token response did not include an access token", retryable=False)
+
+        expires_in_raw = parsed.get("expires_in", 300)
+        try:
+            expires_in = max(30, int(expires_in_raw))
+        except (TypeError, ValueError):
+            expires_in = 300
+        refresh_buffer = min(60, max(5, expires_in // 10))
+        refresh_at = time.monotonic() + max(5, expires_in - refresh_buffer)
+        return access_token, refresh_at
+
+
+_TOKEN_PROVIDER_CACHE: dict[tuple[str, str, str], KeycloakTokenProvider] = {}
+_TOKEN_PROVIDER_CACHE_LOCK = threading.Lock()
+
+
+def _get_token_provider(config: AppConfig) -> KeycloakTokenProvider:
+    cache_key = (
+        config.oidc_token_url.strip(),
+        config.oidc_client_id.strip(),
+        config.oidc_client_secret.strip(),
+    )
+    with _TOKEN_PROVIDER_CACHE_LOCK:
+        provider = _TOKEN_PROVIDER_CACHE.get(cache_key)
+        if provider is None:
+            provider = KeycloakTokenProvider(*cache_key)
+            _TOKEN_PROVIDER_CACHE[cache_key] = provider
+        return provider
+
+
+def check_backend_health(config: AppConfig, timeout: float = 3.0) -> HealthStatus:
+    backend_url = _normalize_backend_base_url(config.backend_url)
+    if not backend_url:
+        return HealthStatus(False, "Backend URL missing")
+
+    health_req = request.Request(
+        f"{backend_url}/health",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "OrderSystemPrinterService/1.0",
+        },
+        method="GET",
+    )
+    try:
+        status_code, _, _ = _http_request(health_req, timeout=timeout)
+        if not 200 <= status_code < 300:
+            return HealthStatus(False, f"HTTP {status_code}")
+    except error.URLError as exc:
+        return HealthStatus(False, f"Unreachable: {exc.reason}")
+    except TimeoutError:
+        return HealthStatus(False, "Connection timed out")
+    except Exception as exc:
+        return HealthStatus(False, str(exc))
+
+    if not config.event_id.strip():
+        return HealthStatus(False, "Connected, Event ID missing")
+    if not config.station_code.strip():
+        return HealthStatus(False, "Connected, station code missing")
+    if not config.oidc_token_url.strip():
+        return HealthStatus(False, "Connected, Keycloak token URL missing")
+    if not config.oidc_client_id.strip():
+        return HealthStatus(False, "Connected, Keycloak client ID missing")
+    if not config.oidc_client_secret.strip():
+        return HealthStatus(False, "Connected, Keycloak client secret missing")
+
+    try:
+        authorization_header = _get_token_provider(config).get_authorization_header(timeout)
+    except BackendRequestError as exc:
+        lowered = str(exc).lower()
+        if exc.status_code in {400, 401}:
+            return HealthStatus(False, "Connected, Keycloak client credentials invalid")
+        if "timed out" in lowered or "timeout" in lowered:
+            return HealthStatus(False, "Connected, Keycloak token request timed out")
+        return HealthStatus(False, "Connected, Keycloak login failed")
+    except Exception as exc:
+        return HealthStatus(False, f"Connected, Keycloak login failed: {exc}")
+
+    auth_query = parse.urlencode(
+        {
+            "event_id": config.event_id.strip(),
+            "station_code": config.station_code.strip().lower(),
+        }
+    )
+    auth_req = request.Request(
+        f"{backend_url}/print-service/health?{auth_query}",
+        headers={
+            "Accept": "application/json",
+            "Authorization": authorization_header,
+            "User-Agent": "OrderSystemPrinterService/1.0",
+        },
+        method="GET",
+    )
+    try:
+        status_code, body, content_type = _http_request(auth_req, timeout=timeout)
+        if 200 <= status_code < 300:
+            return HealthStatus(True, "Connected, printer auth valid")
+        if status_code == 401:
+            message = _summarize_http_error(status_code, body, content_type).lower()
+            if "bearer token" in message:
+                return HealthStatus(False, "Connected, printer bearer token rejected")
+            return HealthStatus(False, "Connected, printer auth invalid")
+        if status_code == 403:
+            message = _summarize_http_error(status_code, body, content_type).lower()
+            if "required role" in message:
+                return HealthStatus(False, "Connected, printer role missing")
+            return HealthStatus(False, "Connected, printer auth forbidden")
+        if status_code == 404:
+            message = _summarize_http_error(status_code, body, content_type).lower()
+            if "station not found" in message:
+                return HealthStatus(False, "Connected, station not found")
+            return HealthStatus(False, "Connected, event not found")
+        if status_code == 422:
+            return HealthStatus(False, "Connected, Event ID or station code invalid")
+        if status_code == 503:
+            return HealthStatus(False, "Connected, backend printer auth not configured")
+        return HealthStatus(False, _summarize_http_error(status_code, body, content_type))
+    except error.URLError as exc:
+        return HealthStatus(False, f"Unreachable: {exc.reason}")
+    except TimeoutError:
+        return HealthStatus(False, "Connection timed out")
+    except Exception as exc:
+        return HealthStatus(False, str(exc))
+
+
+def _nearest_existing_parent(path: Path) -> Path | None:
+    current = path
+    while not current.exists():
+        if current == current.parent:
+            return None
+        current = current.parent
+    return current
+
+
+def check_printer_health(config: AppConfig, timeout: float = 3.0) -> HealthStatus:
+    mode = config.printer_mode
+    if mode == "preview":
+        return HealthStatus(True, "Preview mode")
+
+    if mode == "file":
+        output_path = Path(config.output_path).expanduser()
+        writable_parent = _nearest_existing_parent(output_path.parent)
+        if writable_parent is None:
+            return HealthStatus(False, "Output path unavailable")
+        if not os.access(writable_parent, os.W_OK):
+            return HealthStatus(False, f"No write access: {writable_parent}")
+        return HealthStatus(True, "File output ready")
+
+    if mode == "command":
+        command = config.printer_command.strip()
+        if not command:
+            return HealthStatus(False, "Printer command missing")
+        try:
+            rendered = command.format(
+                file="health-check.txt",
+                job_id="health-check",
+                station_code=config.station_code.strip().lower(),
+            )
+            parts = shlex.split(rendered)
+        except (KeyError, ValueError) as exc:
+            return HealthStatus(False, f"Invalid command: {exc}")
+        if not parts:
+            return HealthStatus(False, "Printer command missing")
+
+        executable = parts[0]
+        has_path = os.path.sep in executable or (os.path.altsep is not None and os.path.altsep in executable)
+        executable_found = Path(executable).exists() if has_path else shutil.which(executable) is not None
+        if not executable_found:
+            return HealthStatus(False, f"Command not found: {executable}")
+        return HealthStatus(True, "Command available")
+
+    if mode == "escpos-network":
+        host = config.escpos_host.strip()
+        if not host:
+            return HealthStatus(False, "ESC/POS host missing")
+        try:
+            with socket.create_connection((host, int(config.escpos_port)), timeout=timeout):
+                pass
+            return HealthStatus(True, f"Connected to {host}:{config.escpos_port}")
+        except OSError as exc:
+            return HealthStatus(False, f"Printer unreachable: {exc}")
+
+    return HealthStatus(False, f"Unsupported mode: {mode}")
+
+
+class BackendClient:
+    def __init__(self, backend_url: str, token_provider: KeycloakTokenProvider) -> None:
+        self.backend_url = _normalize_backend_base_url(backend_url)
+        self.token_provider = token_provider
+
+    def _post(self, path: str, payload: dict) -> object:
+        data = json.dumps(payload).encode("utf-8")
+        for attempt in range(2):
+            authorization_header = self.token_provider.get_authorization_header(20.0, force_refresh=attempt > 0)
+            req = request.Request(
+                f"{self.backend_url}{path}",
+                data=data,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": authorization_header,
+                    "User-Agent": "OrderSystemPrinterService/1.0",
+                },
+                method="POST",
+            )
+            try:
+                with request.urlopen(req, timeout=20) as response:
+                    body = response.read().decode("utf-8")
+                    if not body:
+                        return None
+                    return json.loads(body)
+            except error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 401 and attempt == 0:
+                    self.token_provider.invalidate()
+                    continue
+                summary = _summarize_http_error(exc.code, detail, exc.headers.get("Content-Type", ""))
+                raise BackendRequestError(
+                    summary,
+                    retryable=exc.code in TRANSIENT_HTTP_STATUS_CODES,
+                    status_code=exc.code,
+                ) from exc
+            except error.URLError as exc:
+                raise BackendRequestError(f"Connection failed: {exc.reason}", retryable=True) from exc
+            except TimeoutError as exc:
+                raise BackendRequestError("Connection timed out", retryable=True) from exc
+        raise BackendRequestError("Keycloak bearer token was rejected", retryable=False, status_code=401)
+
+    def claim_next_job(self, event_id: str, station_code: str, agent_name: str) -> dict | None:
+        payload = {
+            "event_id": event_id.strip(),
+            "station_code": station_code.strip(),
+            "agent_name": agent_name.strip(),
+        }
+        result = self._post("/print-service/jobs/claim-next", payload)
+        return result if isinstance(result, dict) else None
+
+    def complete_job(self, job_id: str, agent_name: str) -> None:
+        self._post(f"/print-service/jobs/{parse.quote(job_id)}/complete", {"agent_name": agent_name.strip()})
+
+    def fail_job(self, job_id: str, agent_name: str, error_message: str) -> None:
+        self._post(
+            f"/print-service/jobs/{parse.quote(job_id)}/fail",
+            {"agent_name": agent_name.strip(), "error_message": error_message[:500]},
+        )
+
+
+class TicketPrinter:
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+
+    @staticmethod
+    def _clamp_text_size(value: int) -> int:
+        return max(1, min(8, int(value)))
+
+    @staticmethod
+    def _escpos_init() -> bytes:
+        return b"\x1b@"
+
+    @staticmethod
+    def _escpos_align(mode: str) -> bytes:
+        mapping = {"left": 0, "center": 1, "right": 2}
+        return b"\x1ba" + bytes([mapping.get(mode, 0)])
+
+    @staticmethod
+    def _escpos_bold(enabled: bool) -> bytes:
+        return b"\x1bE" + (b"\x01" if enabled else b"\x00")
+
+    @staticmethod
+    def _escpos_size(size: int) -> bytes:
+        normalized = max(1, min(8, size)) - 1
+        value = (normalized << 4) | normalized
+        return b"\x1d!" + bytes([value])
+
+    @staticmethod
+    def _escpos_reset_style() -> bytes:
+        return TicketPrinter._escpos_bold(False) + TicketPrinter._escpos_size(1) + TicketPrinter._escpos_align("left")
+
+    @staticmethod
+    def _escpos_text(line: str = "") -> bytes:
+        return line.encode("cp437", errors="replace") + b"\n"
+
+    @staticmethod
+    def _fit_left_text(value: str, width: int) -> str:
+        if len(value) <= width:
+            return value
+        if width <= 3:
+            return value[:width]
+        return f"{value[:width - 3].rstrip()}..."
+
+    @staticmethod
+    def _format_item_line(
+        quantity: object,
+        name: object,
+        unit_price: object,
+        total_price: object,
+    ) -> str:
+        item_text = f"{quantity} x {name}"
+        if not unit_price and not total_price:
+            return TicketPrinter._fit_left_text(item_text, RECEIPT_LINE_WIDTH)
+
+        price_text = f"{unit_price} / {total_price}"
+        max_item_width = RECEIPT_LINE_WIDTH - len(price_text) - 1
+        if max_item_width <= 0:
+            return TicketPrinter._fit_left_text(price_text, RECEIPT_LINE_WIDTH)
+
+        fitted_item = TicketPrinter._fit_left_text(item_text, max_item_width)
+        padding = " " * max(1, RECEIPT_LINE_WIDTH - len(fitted_item) - len(price_text))
+        return f"{fitted_item}{padding}{price_text}"
+
+    @staticmethod
+    def _feed_lines(n: int) -> bytes:
+        n = max(0, min(255, int(n)))
+        return b"\x1bd" + bytes([n])   # ESC d n
+
+    @staticmethod
+    def _cut_with_feed(dots: int = 0) -> bytes:
+        # GS V 66 n
+        # Epson Function B:
+        # feed paper to cutting position + n * vertical motion unit, then cut
+        dots = max(0, min(255, int(dots)))
+        return b"\x1d\x56\x42" + bytes([dots])
+
+    def _render_escpos_bytes(self, job: dict, job_id: str) -> bytes:
+        payload = job.get("payload_json")
+        if not isinstance(payload, dict):
+            raise RuntimeError("Missing payload_json for ESC/POS printing")
+
+        station_name = str(
+            payload.get("station_name") or payload.get("station_code", self.config.station_code)
+        ).upper()
+        order_number = payload.get("order_number", "?")
+        table_label = payload.get("table_label", "?")
+        waiter_short_name = payload.get("waiter_short_name", "?")
+        created_at = payload.get("created_at", "")
+        job_type = str(payload.get("job_type", "new_order"))
+        items = payload.get("items", [])
+
+        heading = "NACHDRUCK" if job_type == "reprint" else "NEUE BESTELLUNG"
+        order_size = self._clamp_text_size(self.config.escpos_order_text_size)
+        table_size = self._clamp_text_size(self.config.escpos_table_text_size)
+
+        parts: list[bytes] = [self._escpos_init()]
+        parts.append(self._escpos_align("center"))
+        parts.append(self._escpos_bold(True))
+        parts.append(self._escpos_text(station_name))
+        parts.append(self._escpos_size(table_size))
+        parts.append(self._escpos_text(f"TISCH {table_label}"))
+        parts.append(self._escpos_size(order_size))
+        parts.append(self._escpos_text(f"Bestellung #{order_number}"))
+        parts.append(self._escpos_size(1))
+        parts.append(self._feed_lines(1))
+        parts.append(self._escpos_text(heading))
+        parts.append(self._escpos_bold(False))
+        parts.append(self._escpos_text(f"Kellner {waiter_short_name}"))
+        parts.append(self._escpos_bold(True))
+        parts.append(self._escpos_text(str(created_at)))
+        parts.append(self._escpos_bold(False))
+        parts.append(self._escpos_reset_style())
+        parts.append(self._escpos_text("-" * RECEIPT_LINE_WIDTH))
+
+        for item in items if isinstance(items, list) else []:
+            quantity = item.get("quantity", 1)
+            name = item.get("menu_item_name", "")
+            unit_price = item.get("unit_price")
+            total_price = item.get("total_price")
+            note = item.get("note")
+            parts.append(self._escpos_bold(True))
+            parts.append(
+                self._escpos_text(
+                    self._format_item_line(quantity, name, unit_price, total_price)
+                )
+            )
+            parts.append(self._escpos_bold(False))
+            if note:
+                wrapped_note = textwrap.fill(
+                    str(note),
+                    width=RECEIPT_LINE_WIDTH,
+                    initial_indent="  Notiz: ",
+                    subsequent_indent="  ",
+                )
+                for note_line in wrapped_note.splitlines():
+                    parts.append(self._escpos_text(note_line))
+
+        parts.append(self._escpos_text("-" * RECEIPT_LINE_WIDTH))
+        if self.config.escpos_cut_paper:
+            # 30 gives about 4.23 mm extra feed on Epson example pages
+            # 60 gives about 8.46 mm extra
+            parts.append(self._cut_with_feed(60))
+
+        return b"".join(parts)
+
+    def _print_escpos_network(self, job: dict, job_id: str) -> str:
+        host = self.config.escpos_host.strip()
+        port = int(self.config.escpos_port)
+        if not host:
+            raise RuntimeError("ESC/POS host is empty")
+
+        payload = self._render_escpos_bytes(job, job_id)
+        with socket.create_connection((host, port), timeout=10) as connection:
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            time.sleep(0.2)
+        return f"Printed via ESC/POS network to {host}:{port}"
+
+    def print_job(self, job: dict, ticket_text: str, job_id: str) -> str:
+        if self.config.printer_mode == "escpos-network":
+            return self._print_escpos_network(job, job_id)
+        return self.print_text(ticket_text, job_id)
+
+    def print_text(self, ticket_text: str, job_id: str) -> str:
+        mode = self.config.printer_mode
+        if mode == "preview":
+            return "Preview mode: ticket captured locally."
+
+        if mode == "file":
+            output_path = Path(self.config.output_path).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("a", encoding="utf-8") as handle:
+                handle.write(ticket_text.rstrip())
+                handle.write(f"\n\n=== END {job_id} ===\n\n")
+            return f"Written to {output_path}"
+
+        if mode == "command":
+            command = self.config.printer_command.strip()
+            if not command:
+                raise RuntimeError("Printer command is empty")
+            with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", suffix=".txt") as handle:
+                handle.write(ticket_text)
+                temp_path = handle.name
+            rendered = command.format(
+                file=temp_path,
+                job_id=job_id,
+                station_code=self.config.station_code.strip().lower(),
+            )
+            completed = subprocess.run(rendered, shell=True, check=False, capture_output=True, text=True)
+            if completed.returncode != 0:
+                stderr = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
+                raise RuntimeError(f"Print command failed: {stderr}")
+            return f"Printed via command: {rendered}"
+
+        raise RuntimeError(f"Unsupported printer mode: {mode}")
+
+
+def validate_required_config(config: AppConfig) -> list[str]:
+    missing = [
+        name
+        for name, value in (
+            ("Backend URL", config.backend_url),
+            ("Event ID", config.event_id),
+            ("Station Code", config.station_code),
+            ("Keycloak Token URL", config.oidc_token_url),
+            ("Keycloak Client ID", config.oidc_client_id),
+            ("Keycloak Client Secret", config.oidc_client_secret),
+        )
+        if not value
+    ]
+    if config.printer_mode == "escpos-network" and not config.escpos_host.strip():
+        missing.append("ESC/POS Host")
+    return missing
+
+
+def _summarize_http_error(status_code: int, detail: str, content_type: str) -> str:
+    normalized_type = content_type.lower()
+    cleaned = detail.strip()
+    if "application/json" in normalized_type or cleaned.startswith("{"):
+        try:
+            payload = json.loads(cleaned)
+            title = str(payload.get("title") or "").strip()
+            message = str(payload.get("detail") or payload.get("message") or "").strip()
+            if title and message:
+                return f"HTTP {status_code}: {title} - {message}"
+            if title:
+                return f"HTTP {status_code}: {title}"
+            if message:
+                return f"HTTP {status_code}: {message}"
+        except json.JSONDecodeError:
+            pass
+
+    if "<html" in cleaned.lower() or "text/html" in normalized_type:
+        title_match = re.search(r"<title>(.*?)</title>", cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = " ".join(title_match.group(1).split())
+            return f"HTTP {status_code}: {title}"
+        stripped = re.sub(r"<[^>]+>", " ", cleaned)
+        compact = " ".join(stripped.split())
+        if compact:
+            return f"HTTP {status_code}: {compact[:160]}"
+        return f"HTTP {status_code}: HTML error response"
+
+    if cleaned:
+        single_line = " ".join(cleaned.split())
+        return f"HTTP {status_code}: {single_line[:160]}"
+    return f"HTTP {status_code}"
+
+
+def _sleep_with_stop(seconds: float, stop_requested: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while not stop_requested() and time.monotonic() < deadline:
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+
+def _next_retry_delay(attempt: int, base_delay: int) -> int:
+    normalized_base = max(1, int(base_delay))
+    return min(MAX_RETRY_DELAY_SECONDS, normalized_base * (2 ** max(0, attempt)))
+
+
+def _report_job_state_with_retry(
+    *,
+    action: Callable[[], None],
+    action_label: str,
+    job_id: str,
+    stop_requested: Callable[[], bool],
+    log_callback: Callable[[str], None],
+    base_delay: int,
+) -> bool:
+    attempt = 0
+    while not stop_requested():
+        try:
+            action()
+            if attempt > 0:
+                log_callback(f"Backend connection restored. {action_label} confirmed for {job_id}.")
+            return True
+        except BackendRequestError as exc:
+            if not exc.retryable:
+                log_callback(f"{action_label} failed for {job_id}: {exc}")
+                return False
+            delay = _next_retry_delay(attempt, base_delay)
+            log_callback(f"{action_label} pending for {job_id}: {exc}. Retrying in {delay}s.")
+            attempt += 1
+            _sleep_with_stop(delay, stop_requested)
+        except Exception as exc:
+            log_callback(f"{action_label} failed for {job_id}: {exc}")
+            return False
+    return False
+
+
+def _is_printer_outage(config: AppConfig, exc: Exception, health_status: HealthStatus | None = None) -> bool:
+    mode = config.printer_mode
+    message = str(exc).lower()
+    generic_transient_fragments = (
+        "timed out",
+        "timeout",
+        "refused",
+        "unreachable",
+        "network is unreachable",
+        "broken pipe",
+        "reset by peer",
+        "temporarily unavailable",
+    )
+    if health_status is not None and not health_status.ok:
+        return True
+    if isinstance(exc, (OSError, TimeoutError, socket.timeout)):
+        return True
+    if any(fragment in message for fragment in generic_transient_fragments):
+        return True
+
+    if mode == "escpos-network":
+        return True
+
+    return False
+
+
+def _print_job_with_retry(
+    *,
+    config: AppConfig,
+    printer: TicketPrinter,
+    job: dict,
+    rendered_text: str,
+    job_id: str,
+    stop_requested: Callable[[], bool],
+    log_callback: Callable[[str], None],
+) -> tuple[str | None, bool]:
+    attempt = 0
+    while not stop_requested():
+        try:
+            return printer.print_job(job, rendered_text, job_id), attempt > 0
+        except Exception as exc:
+            health_status = check_printer_health(config)
+            if not _is_printer_outage(config, exc, health_status):
+                raise
+
+            detail = health_status.message if not health_status.ok else str(exc)
+            delay = _next_retry_delay(attempt, config.poll_interval_seconds)
+            if attempt == 0:
+                log_callback(f"Printer unavailable while printing {job_id}: {detail}. Retrying in {delay}s.")
+            else:
+                log_callback(f"Printer still unavailable for {job_id}: {detail}. Retrying in {delay}s.")
+            attempt += 1
+            _sleep_with_stop(delay, stop_requested)
+
+    return None, attempt > 0
+
+
+def run_worker_loop(
+    config: AppConfig,
+    stop_requested: Callable[[], bool],
+    log_callback: Callable[[str], None],
+    preview_callback: Callable[[str], None] | None = None,
+) -> None:
+    client = BackendClient(config.backend_url, _get_token_provider(config))
+    printer = TicketPrinter(config)
+    backend_retry_attempt = 0
+    backend_unavailable = False
+
+    while not stop_requested():
+        job_id: str | None = None
+        try:
+            job = client.claim_next_job(config.event_id, config.station_code, config.agent_name)
+            if backend_unavailable:
+                log_callback("Backend connection restored.")
+                backend_unavailable = False
+                backend_retry_attempt = 0
+            if job is None:
+                _sleep_with_stop(config.poll_interval_seconds, stop_requested)
+                continue
+
+            job_id = str(job.get("id", "unknown-job"))
+            rendered_text = str(job.get("rendered_text", "")).strip() + "\n"
+            if preview_callback is not None:
+                preview_callback(rendered_text)
+            log_callback(f"Claimed job {job_id}")
+            result, recovered_after_outage = _print_job_with_retry(
+                config=config,
+                printer=printer,
+                job=job,
+                rendered_text=rendered_text,
+                job_id=job_id,
+                stop_requested=stop_requested,
+                log_callback=log_callback,
+            )
+            if result is None:
+                log_callback(f"Stopped while waiting for printer recovery for {job_id}.")
+                continue
+            completed = _report_job_state_with_retry(
+                action=lambda: client.complete_job(job_id, config.agent_name),
+                action_label="Completion",
+                job_id=job_id,
+                stop_requested=stop_requested,
+                log_callback=log_callback,
+                base_delay=config.poll_interval_seconds,
+            )
+            if completed:
+                if recovered_after_outage:
+                    log_callback(f"Printer recovered. Resumed processing with {job_id}.")
+                log_callback(f"{result} | completed {job_id}")
+            elif stop_requested():
+                log_callback(f"Stopped before completion could be confirmed for {job_id}.")
+            else:
+                log_callback(f"Printed {job_id}, but completion could not be confirmed.")
+        except BackendRequestError as exc:
+            if not exc.retryable:
+                backend_unavailable = False
+                backend_retry_attempt = 0
+                delay = max(1, int(config.poll_interval_seconds))
+                detail = str(exc)
+                lowered = detail.lower()
+                if exc.status_code == 401:
+                    if "client credential" in lowered or "invalid_client" in lowered:
+                        log_callback(
+                            f"Backend authorization failed: {exc}. Check the Keycloak client ID and secret and retrying in {delay}s."
+                        )
+                    elif "bearer token" in lowered:
+                        log_callback(
+                            f"Backend authorization failed: {exc}. Check the Keycloak printer login and retrying in {delay}s."
+                        )
+                    else:
+                        log_callback(
+                            f"Backend authorization failed: {exc}. Check the printer Keycloak configuration and retrying in {delay}s."
+                        )
+                elif exc.status_code == 403 and "required role" in lowered:
+                    log_callback(
+                        f"Backend authorization failed: {exc}. The Keycloak client is missing the printer role and retrying in {delay}s."
+                    )
+                elif exc.status_code == 503 and "printer auth" in lowered:
+                    log_callback(
+                        f"Backend authorization failed: {exc}. The backend printer Keycloak settings are incomplete and retrying in {delay}s."
+                    )
+                else:
+                    log_callback(f"Backend request failed: {exc}. Retrying in {delay}s.")
+                _sleep_with_stop(delay, stop_requested)
+                continue
+            delay = _next_retry_delay(backend_retry_attempt, config.poll_interval_seconds)
+            if not backend_unavailable:
+                log_callback(f"Backend unavailable: {exc}. Retrying in {delay}s.")
+            else:
+                log_callback(f"Backend still unavailable: {exc}. Retrying in {delay}s.")
+            backend_unavailable = True
+            backend_retry_attempt += 1
+            _sleep_with_stop(delay, stop_requested)
+        except Exception as exc:
+            log_callback(f"Worker error: {exc}")
+            if job_id is not None:
+                failed = _report_job_state_with_retry(
+                    action=lambda: client.fail_job(job_id, config.agent_name, str(exc)),
+                    action_label="Failure report",
+                    job_id=job_id,
+                    stop_requested=stop_requested,
+                    log_callback=log_callback,
+                    base_delay=config.poll_interval_seconds,
+                )
+                if not failed and not stop_requested():
+                    log_callback(f"Local print error for {job_id} could not be reported to the backend.")
+            _sleep_with_stop(config.poll_interval_seconds, stop_requested)
